@@ -1,0 +1,40 @@
+{
+  "name": "vibe-knowledge-studio",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node server/index.mjs",
+    "build": "tsc -b && vite build",
+    "start": "NODE_ENV=production node server/index.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "test:ui": "node tests/browser.mjs",
+    "test:ai-ui": "node tests/ai.browser.mjs",
+    "check": "tsc -b",
+    "format": "prettier --write src shared server tests docs README.md package.json tsconfig.json vite.config.ts index.html",
+    "format:check": "prettier --check src shared server tests docs README.md package.json tsconfig.json vite.config.ts index.html"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "lucide-react": "^0.552.0",
+    "multer": "^2.0.2",
+    "playwright": "^1.56.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "three": "^0.187.0",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.2",
+    "@vitejs/plugin-react": "^5.1.0",
+    "prettier": "^3.10.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.2"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}
