@@ -17,7 +17,7 @@ import { complete, listModels, parseJSON, testConnection } from './ai/client.mjs
 import { readSceneDrafts } from './ai/progress.mjs';
 import { synthTrack, encodeWav } from '../shared/sound.mjs';
 import { createSfxEvents } from '../shared/sfx.mjs';
-import { synthesize, synthesizeProject, listVoices } from './tts.mjs';
+import { synthesize, listVoices, speechText, ttsFileName, fitVoiceTiming } from './tts.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const data = path.resolve(process.env.VIBE_DATA_DIR || path.join(root, '.data'));
@@ -134,6 +134,7 @@ app.get('/api/health', (_req, res) => {
     verified: Boolean(current?.verifiedAt),
     provider: current?.provider || '',
     model: current?.model || '',
+    tts: supportsTts(current),
     ffmpeg: healthyFFmpeg(),
     browser: Boolean(chrome),
   });
@@ -466,69 +467,102 @@ app.post('/api/ai/rewrite-scene', async (req, res, next) => {
 /* ---- TTS 配音 ---- */
 const ttsDir = path.join(data, 'tts');
 await mkdir(ttsDir, { recursive: true });
+const TTS_TTL = 7 * 24 * 3600e3;
+
+/** 配音文件只允许安全字符，且和 schema 的 id 规则保持一致。 */
+function ttsFile(projectId, sceneId) {
+  return path.join(ttsDir, ttsFileName(projectId, sceneId));
+}
+
+/** 启动时和每次配音后回收旧文件，避免 .data/tts 只增不减。 */
+async function pruneTts() {
+  try {
+    const now = Date.now();
+    for (const name of await readdir(ttsDir)) {
+      if (!name.endsWith('.wav')) continue;
+      const full = path.join(ttsDir, name);
+      const info = await stat(full).catch(() => null);
+      if (!info || now - info.mtimeMs > TTS_TTL) await rm(full, { force: true });
+    }
+  } catch (e) {
+    console.error('TTS cleanup:', e.message);
+  }
+}
+await pruneTts();
+
+/** 目前只对接了 DashScope CosyVoice，提前给出明确提示，而不是让用户看到网络错误。 */
+function supportsTts(profile) {
+  if (!profile) return false;
+  if (profile.provider === 'qwen') return true;
+  try {
+    return new URL(profile.baseUrl).hostname.includes('aliyuncs.com');
+  } catch {
+    return false;
+  }
+}
+
+function ttsProfile(profile) {
+  if (!profile) throw new AIError('请先在设置中接入模型。', 'AI_NOT_CONFIGURED', 422);
+  if (!supportsTts(profile))
+    throw new AIError(
+      'AI 配音目前只支持通义千问（DashScope CosyVoice）。请切换到通义千问，并在阿里云百炼控制台开通语音合成。',
+      'TTS_PROVIDER',
+      422,
+    );
+  return profile;
+}
 
 app.get('/api/tts/voices', (_req, res) => res.json({ voices: listVoices() }));
 
-/* 生成单个分镜配音预览：返回 WAV 二进制 + 逐字时间戳（放在响应头）。 */
-app.post('/api/tts/preview', async (req, res, next) => {
-  try {
-    const current = settings.current();
-    if (!current) throw new AIError('请先在设置中接入模型。', 'AI_NOT_CONFIGURED', 422);
-    const text = typeof req.body?.text === 'string' ? req.body.text : '';
-    const voice = typeof req.body?.voice === 'string' ? req.body.voice : 'longanyang';
-    if (!text.trim()) throw new AIError('没有可配音的文本。', 'TTS_EMPTY', 400);
-    const result = await synthesize(text, current, { voice, signal: requestSignal(res) });
-    const wav = encodeWav(result.samples, result.sampleRate);
-    res.set({
-      'Content-Type': 'audio/wav',
-      'X-TTS-Words': encodeURIComponent(JSON.stringify(result.words)),
-      'X-TTS-Duration': String(Math.round(result.durationMs)),
-    });
-    res.send(Buffer.from(wav));
-  } catch (e) {
-    next(e);
-  }
-});
-
-/* 生成全片配音：逐分镜合成，返回每个分镜的音频文件名 + 逐字时间戳。
- * 音频落盘到 .data/tts/，供 MP4 导出时混音。 */
+/* 生成全片配音：逐分镜合成，返回每个分镜的逐字时间戳与时长。
+ * 音频落盘到 .data/tts/，供 MP4 导出与预览混音；超长时用 atempo 加速并同步缩放时间戳。 */
 app.post('/api/tts/generate', async (req, res, next) => {
   try {
-    const current = settings.current();
-    if (!current) throw new AIError('请先在设置中接入模型。', 'AI_NOT_CONFIGURED', 422);
+    const current = ttsProfile(settings.current());
     const project = projectSchema.parse(req.body.project);
     const voice = typeof req.body?.voice === 'string' ? req.body.voice : 'longanyang';
     const model = typeof req.body?.model === 'string' ? req.body.model : 'cosyvoice-v3-flash';
-
-    // 为每个分镜生成配音，返回带 voice 字段的更新后分镜
+    const signal = requestSignal(res);
     const scenes = [];
+    const warnings = [];
+
     for (let i = 0; i < project.scenes.length; i++) {
       const s = project.scenes[i];
-      const text = [s.title, s.subtitle].filter(Boolean).join('。');
-      if (!text.trim()) {
+      if (signal.aborted) throw new AIError('已取消配音生成。', 'CANCELLED', 499);
+      const text = speechText(s);
+      if (!text) {
         scenes.push(s);
         continue;
       }
-      const result = await synthesize(text, current, { voice, model, signal: requestSignal(res) });
-      // 保存音频（16-bit PCM WAV），文件名用分镜 id
-      const wav = encodeWav(result.samples, result.sampleRate);
-      const filename = `${project.id}-${s.id}.wav`;
-      await writeFile(path.join(ttsDir, filename), Buffer.from(wav));
+      const result = await synthesize(text, current, { voice, model, signal });
+      const sceneDur = Math.max(0.2, s.end - s.start);
+      const fit = fitVoiceTiming(result, sceneDur);
+
+      await writeFile(
+        ttsFile(project.id, s.id),
+        Buffer.from(encodeWav(result.samples, result.sampleRate)),
+      );
+      if (fit.tempo > 1.01)
+        warnings.push({
+          sceneId: s.id,
+          title: s.title,
+          neededMs: Math.round(fit.neededMs),
+          sceneMs: Math.round(sceneDur * 1000),
+          tempo: Number(fit.tempo.toFixed(3)),
+          truncated: fit.overflow,
+        });
       scenes.push({
         ...s,
         voice: {
           voice,
-          words: result.words,
-          durationMs: Math.round(result.durationMs),
+          words: fit.words,
+          durationMs: Math.round(fit.fittedMs),
+          ...(fit.tempo > 1.01 ? { tempo: Number(fit.tempo.toFixed(4)) } : {}),
         },
-        _ttsFile: filename,
       });
     }
-    res.json({
-      scenes: scenes.map(({ _ttsFile, ...rest }) => ({ ...rest, _ttsFile })),
-      voice,
-      model,
-    });
+    await pruneTts();
+    res.json({ scenes, voice, model, warnings });
   } catch (e) {
     next(e);
   }
@@ -678,11 +712,17 @@ async function mixAudioTrack(project, duration, output) {
     const voiceFiles = [];
     for (const s of project.scenes) {
       if (!s.voice || !s.voice.words?.length) continue;
-      const file = path.join(ttsDir, `${project.id}-${s.id}.wav`);
+      const file = ttsFile(project.id, s.id);
       const ok = await stat(file)
         .then(() => true)
         .catch(() => false);
-      if (ok) voiceFiles.push({ file, start: s.start, end: s.end });
+      if (ok)
+        voiceFiles.push({
+          file,
+          start: s.start,
+          end: s.end,
+          tempo: s.voice.tempo && s.voice.tempo > 1.01 ? s.voice.tempo : 1,
+        });
     }
 
     const rhythmPath = path.join(temp, 'rhythm.wav');
@@ -710,7 +750,7 @@ async function mixAudioTrack(project, duration, output) {
     const voiceInputs = []; // [{index, start}]
     for (const vf of voiceFiles) {
       args.push('-i', vf.file);
-      voiceInputs.push({ index: nextInput, start: vf.start, end: vf.end });
+      voiceInputs.push({ index: nextInput, start: vf.start, end: vf.end, tempo: vf.tempo });
       nextInput += 1;
     }
     for (const event of events) {
@@ -733,13 +773,15 @@ async function mixAudioTrack(project, duration, output) {
       );
       labels.push('[base]');
     }
-    // 配音音轨：按分镜起点用 adelay 对齐到全片时间轴，音量 1.0（主音轨）
+    // 配音音轨：按分镜起点用 adelay 对齐到全片时间轴，音量 1.0（主音轨）。
+    // 生成时超长的配音已记录 tempo，这里用 atempo 保持音高加速到分镜时长内。
     voiceInputs.forEach((vi, index) => {
       const delay = Math.round(vi.start * 1000);
       const label = `voice${index}`;
       const voiceDur = Math.max(0.1, vi.end - vi.start);
+      const tempo = vi.tempo > 1.01 ? `atempo=${vi.tempo.toFixed(4)},` : '';
       filters.push(
-        `[${vi.index}:a]atrim=duration=${voiceDur},asetpts=PTS-STARTPTS,volume=1.0,adelay=${delay}|${delay}[${label}]`,
+        `[${vi.index}:a]${tempo}atrim=duration=${voiceDur},asetpts=PTS-STARTPTS,volume=1.0,adelay=${delay}|${delay}[${label}]`,
       );
       labels.push(`[${label}]`);
     });
@@ -777,6 +819,21 @@ async function mixAudioTrack(project, duration, output) {
     await rm(temp, { recursive: true, force: true });
   }
 }
+/** 导入项目/换机器后配音 wav 可能不存在；全部缺失时按无配音渲染。 */
+async function projectWithAvailableVoice(project) {
+  const voiced = project.scenes.filter((s) => s.voice?.words?.length);
+  if (!voiced.length) return project;
+  const found = await Promise.all(
+    voiced.map((s) =>
+      stat(ttsFile(project.id, s.id))
+        .then(() => true)
+        .catch(() => false),
+    ),
+  );
+  if (found.some(Boolean)) return project;
+  return { ...project, scenes: project.scenes.map((s) => ({ ...s, voice: undefined })) };
+}
+
 async function runRender(job, project, { quality, fps, duration }) {
   const base = quality === '1080p' ? 1080 : 720;
   const [w, h] =
@@ -794,10 +851,13 @@ async function runRender(job, project, { quality, fps, duration }) {
     failed,
     stderr = '';
   try {
+    // 配音文件可能因为导入项目或换机器而缺失：这种情况按无配音渲染，
+    // 避免出现「逐字字幕在动、但没有声音」的假配音画面。
+    const renderProject = await projectWithAvailableVoice(project);
     let audio;
-    const hasVoice = project.scenes.some((s) => s.voice && s.voice.words?.length);
-    if (project.music !== 'none' || project.sfxStyle !== 'off' || hasVoice) {
-      await mixAudioTrack(project, duration, wave);
+    const hasVoice = renderProject.scenes.some((s) => s.voice && s.voice.words?.length);
+    if (renderProject.music !== 'none' || renderProject.sfxStyle !== 'off' || hasVoice) {
+      await mixAudioTrack(renderProject, duration, wave);
       audio = wave;
     }
     // 渲染页只加载本站自己的 /render 文档，但没必要默认关掉 Chrome 的沙箱：
@@ -874,7 +934,7 @@ async function runRender(job, project, { quality, fps, duration }) {
           }
           return { frames, preview };
         },
-        { p: project, start: i, count: Math.min(8, count - i), fps, w, h, sample },
+        { p: renderProject, start: i, count: Math.min(8, count - i), fps, w, h, sample },
       );
       for (const frame of frames) {
         if (!encoder.stdin.write(Buffer.from(frame, 'base64'))) await once(encoder.stdin, 'drain');
@@ -928,7 +988,13 @@ app.post('/api/export/html', async (req, res, next) => {
       .replace(/^export\s+/gm, '')
       .replace(/^import\s+.*$/gm, '');
     const bundled = `${figures}\n${engine}`;
-    const json = JSON.stringify(project).replace(/</g, '\\u003c');
+    // 离线 HTML 不内嵌音频：去掉逐字时间戳，回退到普通副标题，
+    // 避免播放时出现「无声的卡拉 OK 字幕」。”
+    const offline = {
+      ...project,
+      scenes: project.scenes.map(({ voice, ...scene }) => scene),
+    };
+    const json = JSON.stringify(offline).replace(/</g, '\\u003c');
     res
       .set('Content-Disposition', 'attachment; filename="vibe-animation.html"')
       .type('html')

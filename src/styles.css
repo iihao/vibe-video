@@ -871,7 +871,9 @@ h3 {
   font-size: 11px;
   cursor: pointer;
   white-space: nowrap;
-  transition: background 0.15s, color 0.15s;
+  transition:
+    background 0.15s,
+    color 0.15s;
 }
 .voice-generate:hover:not(:disabled) {
   background: #3a2820;
@@ -4561,6 +4563,42 @@ h3 {
 }
 .ai-rewrite-actions .text-button {
   font-size: 10px;
+}
+/* AI 配音：沿用 AI 改写框的卡片样式，只换强调色。 */
+.voice-box {
+  border-color: #9bc8ff26;
+  background: #9bc8ff05;
+}
+.voice-hint {
+  margin: 0 0 10px;
+  color: #7d838c;
+  font-size: 10px;
+  line-height: 1.7;
+}
+.voice-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.voice-controls select {
+  flex: 1;
+  min-width: 130px;
+  font-size: 11px;
+  padding: 8px 26px 8px 9px;
+}
+.voice-controls .outline-button {
+  font-size: 10px;
+  padding: 7px 10px;
+  white-space: nowrap;
+}
+.voice-controls .text-button {
+  font-size: 10px;
+  white-space: nowrap;
+}
+.voice-warn {
+  color: #d9a07e;
+  margin: 10px 0 0;
 }
 @media (max-width: 600px) {
   .ai-settings {

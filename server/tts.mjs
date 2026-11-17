@@ -34,8 +34,13 @@ function wsUrlFor(baseUrl) {
 }
 
 /* 合成一段文本，返回 { audio: Float32Array(单声道样本), sampleRate, words: [{text,beginMs,endMs}] } */
-export async function synthesize(text, profile, { voice = 'longanyang', model = 'cosyvoice-v3-flash', signal } = {}) {
-  if (!profile?.apiKey) throw new AIError('请先接入支持语音合成的模型（如通义千问）。', 'TTS_NO_KEY', 422);
+export async function synthesize(
+  text,
+  profile,
+  { voice = 'longanyang', model = 'cosyvoice-v3-flash', signal } = {},
+) {
+  if (!profile?.apiKey)
+    throw new AIError('请先接入支持语音合成的模型（如通义千问）。', 'TTS_NO_KEY', 422);
   const clean = String(text || '').trim();
   if (!clean) throw new AIError('没有可配音的文本。', 'TTS_EMPTY', 400);
 
@@ -56,8 +61,11 @@ export async function synthesize(text, profile, { voice = 'longanyang', model = 
 
   const timeoutMs = (profile.timeout || 180) * 1000;
   const timer = setTimeout(() => {
-    lastError = lastError || new AIError(`语音合成超过 ${profile.timeout} 秒，请重试。`, 'TTS_TIMEOUT', 504);
-    try { ws.close(); } catch {}
+    lastError =
+      lastError || new AIError(`语音合成超过 ${profile.timeout} 秒，请重试。`, 'TTS_TIMEOUT', 504);
+    try {
+      ws.close();
+    } catch {}
   }, timeoutMs);
 
   const cleanup = () => {
@@ -66,7 +74,9 @@ export async function synthesize(text, profile, { voice = 'longanyang', model = 
   };
   const onAbort = () => {
     lastError = new AIError('已取消配音生成。', 'CANCELLED', 499);
-    try { ws.close(); } catch {}
+    try {
+      ws.close();
+    } catch {}
   };
   if (signal) signal.addEventListener('abort', onAbort);
 
@@ -79,7 +89,9 @@ export async function synthesize(text, profile, { voice = 'longanyang', model = 
       return true;
     } catch (e) {
       lastError = lastError || new AIError(`发送配音请求失败：${e?.message || e}`, 'TTS_SEND', 502);
-      try { ws.close(); } catch {}
+      try {
+        ws.close();
+      } catch {}
       return false;
     }
   };
@@ -109,7 +121,13 @@ export async function synthesize(text, profile, { voice = 'longanyang', model = 
 
     ws.onmessage = (ev) => {
       // eslint-disable-next-line no-console
-      if (process.env.TTS_DEBUG) console.log('[tts] onmessage typeof=', typeof ev.data, 'len=', typeof ev.data === 'string' ? ev.data.length : ev.data?.byteLength);
+      if (process.env.TTS_DEBUG)
+        console.log(
+          '[tts] onmessage typeof=',
+          typeof ev.data,
+          'len=',
+          typeof ev.data === 'string' ? ev.data.length : ev.data?.byteLength,
+        );
       if (typeof ev.data === 'string') {
         // 文本事件：sentence-begin / sentence-end / task-finished 等
         let msg;
@@ -119,11 +137,13 @@ export async function synthesize(text, profile, { voice = 'longanyang', model = 
           return;
         }
         // eslint-disable-next-line no-console
-        if (process.env.TTS_DEBUG) console.log('[tts] event=', msg?.header?.event, 'err=', msg?.header?.error_message);
+        if (process.env.TTS_DEBUG)
+          console.log('[tts] event=', msg?.header?.event, 'err=', msg?.header?.error_message);
         // 收到 task-started 后，才开始发送文本与结束标记（协议要求先等确认）。
         if (msg?.header?.event === 'task-started') {
           // eslint-disable-next-line no-console
-          if (process.env.TTS_DEBUG) console.log('[tts] task-started, 发送 continue-task + finish-task');
+          if (process.env.TTS_DEBUG)
+            console.log('[tts] task-started, 发送 continue-task + finish-task');
           send({
             header: { action: 'continue-task', task_id: taskId, streaming: 'duplex' },
             payload: { input: { text: clean } },
@@ -189,13 +209,22 @@ export async function synthesize(text, profile, { voice = 'longanyang', model = 
     };
 
     ws.onerror = () => {
-      lastError = lastError || new AIError('无法连接语音合成服务，请检查网络与密钥。', 'TTS_NETWORK', 502);
+      lastError =
+        lastError || new AIError('无法连接语音合成服务，请检查网络与密钥。', 'TTS_NETWORK', 502);
     };
 
     ws.onclose = () => {
       cleanup();
       // eslint-disable-next-line no-console
-      if (process.env.TTS_DEBUG) console.log('[tts] onclose lastError=', lastError?.code, 'chunks=', chunks.length, 'taskFinished=', taskFinished);
+      if (process.env.TTS_DEBUG)
+        console.log(
+          '[tts] onclose lastError=',
+          lastError?.code,
+          'chunks=',
+          chunks.length,
+          'taskFinished=',
+          taskFinished,
+        );
       if (lastError) reject(lastError);
       else if (!taskFinished && chunks.length === 0)
         reject(new AIError('语音合成未返回音频，请检查模型与音色是否匹配。', 'TTS_NO_AUDIO', 502));
@@ -214,26 +243,43 @@ export async function synthesize(text, profile, { voice = 'longanyang', model = 
   return { samples, sampleRate, words, durationMs };
 }
 
-/* 把一个 project 的所有分镜文案合成为一段连续配音。
- * 每个分镜配音从该分镜开始播放，时间戳按 scene.start 偏移对齐到全片时间轴。 */
-export async function synthesizeProject(project, profile, { voice, model, signal, onProgress } = {}) {
-  const scenes = project.scenes || [];
-  const perScene = [];
-  for (let i = 0; i < scenes.length; i++) {
-    const s = scenes[i];
-    const text = [s.title, s.subtitle].filter(Boolean).join('。');
-    if (!text.trim()) {
-      perScene.push(null);
-      continue;
-    }
-    if (signal?.aborted) throw new AIError('已取消配音生成。', 'CANCELLED', 499);
-    const result = await synthesize(text, profile, { voice, model, signal });
-    perScene.push(result);
-    onProgress?.(i + 1, scenes.length, s.title);
-  }
-  return perScene;
-}
-
 export function listVoices() {
   return DEFAULT_VOICES;
+}
+
+/** 旁白文案：去掉句末标点后以逗号连接，避免出现「。。」。 */
+export function speechText(scene) {
+  const clean = (value) =>
+    String(value || '')
+      .trim()
+      .replace(/[。，、；：!?！？…]+$/g, '');
+  return [clean(scene.title), clean(scene.subtitle)].filter(Boolean).join('，');
+}
+
+/** 配音文件只允许安全字符，避免客户端 id 造成路径穿越。 */
+export function ttsFileName(projectId, sceneId) {
+  return `${projectId}-${sceneId}`.replace(/[^A-Za-z0-9_-]/g, '_') + '.wav';
+}
+
+/**
+ * 把配音时长压进分镜：超长时用 atempo 加速（上限 1.6x），
+ * 并同步缩放逐字时间戳，让字幕和声音继续对齐。
+ * 加速后仍放不下时返回 overflow=true，调用方应提示用户缩短文案。
+ */
+export function fitVoiceTiming(result, sceneDur) {
+  const neededMs = result.durationMs;
+  const sceneMs = sceneDur * 1000;
+  const tempo = neededMs > sceneMs * 1.02 ? Math.min(1.6, neededMs / sceneMs) : 1;
+  const fittedMs = neededMs / tempo;
+  return {
+    tempo,
+    neededMs,
+    fittedMs,
+    overflow: fittedMs > sceneMs + 80,
+    words: result.words.map((w) => ({
+      text: w.text,
+      beginMs: w.beginMs / tempo,
+      endMs: w.endMs / tempo,
+    })),
+  };
 }

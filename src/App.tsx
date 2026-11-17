@@ -329,6 +329,7 @@ export default function App() {
   const [ttsVoices, setTtsVoices] = useState<{ id: string; name: string }[]>([]),
     [ttsVoice, setTtsVoice] = useState('longanyang'),
     [generatingVoice, setGeneratingVoice] = useState(false);
+  const ttsAbort = useRef<AbortController | null>(null);
   const [search, setSearch] = useState(''),
     [filter, setFilter] = useState('全部'),
     [command, setCommand] = useState('');
@@ -367,6 +368,7 @@ export default function App() {
     () => () => {
       generationAbort.current?.abort();
       rewriteAbort.current?.abort();
+      ttsAbort.current?.abort();
     },
     [],
   );
@@ -482,6 +484,11 @@ export default function App() {
         if (key !== 'duration') return { ...p, [key]: value };
         // 时长一改，分镜必须跟着重排：否则下拉框说 30 秒、时间轴和导出的仍是 60 秒。
         const next = retimeProject(p, Number(value));
+        // 配音文件与逐字时间戳是按旧分镜时长生成的，改了时长就清掉，避免越剪越断。
+        if (next.scenes.some((s) => s.voice)) {
+          next.scenes = next.scenes.map((s) => ({ ...s, voice: undefined }));
+          notify('时长已修改，配音已清除，请重新生成配音');
+        }
         if (timeRef.current > next.duration) {
           setTime(next.duration);
           setPlaying(false);
@@ -652,7 +659,16 @@ export default function App() {
   const updateScene = (key: keyof Scene, value: string) => {
     setProject((p) => ({
       ...p,
-      scenes: p.scenes.map((s, i) => (i === selectedScene ? { ...s, [key]: value } : s)),
+      scenes: p.scenes.map((s, i) => {
+        if (i !== selectedScene) return s;
+        const next = { ...s, [key]: value };
+        // 文案改了，旧配音和逐字时间戳就失效了；清掉比默默声画不同步好。
+        if ((key === 'title' || key === 'subtitle') && s.voice) {
+          next.voice = undefined;
+          notify('文案已修改，配音已清除，请重新生成配音');
+        }
+        return next;
+      }),
     }));
   };
   const rewriteScene = async () => {
@@ -697,29 +713,58 @@ export default function App() {
       setModal('settings');
       return;
     }
-    setGeneratingVoice(true);
     const controller = new AbortController();
+    ttsAbort.current = controller;
+    setGeneratingVoice(true);
     try {
-      const result = await api<{ scenes: Scene[]; voice: string; model: string }>(
-        '/api/tts/generate',
-        {
-          ...post({ project, voice: ttsVoice }),
-          signal: controller.signal,
-        },
-      );
+      const result = await api<{
+        scenes: Scene[];
+        voice: string;
+        model: string;
+        warnings?: {
+          title: string;
+          neededMs: number;
+          sceneMs: number;
+          tempo: number;
+          truncated: boolean;
+        }[];
+      }>('/api/tts/generate', {
+        ...post({ project, voice: ttsVoice }),
+        signal: controller.signal,
+      });
       setProject((p) => ({
         ...p,
-        scenes: p.scenes.map((s, i) => {
+        scenes: p.scenes.map((s) => {
           const updated = result.scenes.find((r) => r.id === s.id);
           return updated ? { ...s, voice: updated.voice } : s;
         }),
       }));
-      notify(`配音已生成（${result.model} · ${result.voice}），字幕将逐字跟随`);
+      const warnings = result.warnings || [];
+      const truncated = warnings.filter((w) => w.truncated);
+      if (truncated.length)
+        notify(
+          `配音已生成，但 ${truncated.length} 幕在加速后仍超出时长（${truncated
+            .slice(0, 2)
+            .map((w) => `「${w.title}」`)
+            .join('')}），建议缩短文案或加长视频`,
+        );
+      else if (warnings.length)
+        notify(`配音已生成，${warnings.length} 幕文案较长，已自动加速以贴合分镜`);
+      else notify(`配音已生成（${result.model} · ${result.voice}），字幕将逐字跟随`);
     } catch (e) {
       if (!controller.signal.aborted) notify((e as Error).message);
+      else notify('已取消配音生成');
     } finally {
+      if (ttsAbort.current === controller) ttsAbort.current = null;
       setGeneratingVoice(false);
     }
+  };
+  const clearVoice = () => {
+    setProject((p) => ({
+      ...p,
+      scenes: p.scenes.map((s) => ({ ...s, voice: undefined })),
+    }));
+    notify('已移除配音，视频将使用背景音乐与音效');
   };
   const uploadFile = async (file?: File) => {
     if (!file) return;
@@ -832,6 +877,8 @@ export default function App() {
     project.scenes.findIndex((s) => time >= s.start && time < s.end),
   );
   const scene = project.scenes[selectedScene] || project.scenes[0];
+  const voiceCount = project.scenes.filter((s) => s.voice?.words?.length).length;
+  const voiceReady = Boolean(status?.configured && status.tts);
   const pageNames = {
     create: '创作工作台',
     projects: '我的项目',
@@ -1145,6 +1192,73 @@ export default function App() {
                           </div>
                         )}
                       </div>
+                      <div className="ai-rewrite-box voice-box">
+                        <div className="ai-rewrite-heading">
+                          <span>
+                            <Volume2 size={14} /> AI 配音
+                          </span>
+                          <small>{voiceReady ? '通义千问 · CosyVoice' : '需要通义千问'}</small>
+                        </div>
+                        <p className="voice-hint">
+                          {voiceCount
+                            ? `已为 ${voiceCount} / ${project.scenes.length} 幕生成旁白，逐字字幕跟随朗读。修改文案会自动清除配音。`
+                            : '按标题与解释文案生成普通话旁白。较长文案会自动加速贴合分镜，仍超出时会提示。'}
+                        </p>
+                        <div className="voice-controls">
+                          <select
+                            id="tts-voice"
+                            aria-label="配音音色"
+                            value={ttsVoice}
+                            onChange={(e) => setTtsVoice(e.target.value)}
+                            disabled={generatingVoice}
+                          >
+                            {(ttsVoices.length
+                              ? ttsVoices
+                              : [
+                                  { id: 'longanyang', name: '龙洋洋（女声·自然）' },
+                                  { id: 'longxiaochun_v2', name: '龙晓春（女声·温柔）' },
+                                  { id: 'longhuashuo_v2', name: '龙华硕（男声·沉稳）' },
+                                ]
+                            ).map((v) => (
+                              <option key={v.id} value={v.id}>
+                                {v.name}
+                              </option>
+                            ))}
+                          </select>
+                          <button
+                            className="outline-button"
+                            onClick={() => void generateVoice()}
+                            disabled={generatingVoice || !voiceReady}
+                          >
+                            {generatingVoice ? (
+                              <LoaderCircle size={13} className="spin" />
+                            ) : (
+                              <Sparkles size={13} />
+                            )}
+                            {generatingVoice ? '配音中…' : voiceCount ? '重新生成配音' : '生成配音'}
+                          </button>
+                          {generatingVoice ? (
+                            <button
+                              className="text-button"
+                              onClick={() => ttsAbort.current?.abort()}
+                            >
+                              取消
+                            </button>
+                          ) : (
+                            voiceCount > 0 && (
+                              <button className="text-button" onClick={clearVoice}>
+                                清除配音
+                              </button>
+                            )
+                          )}
+                        </div>
+                        {!voiceReady && (
+                          <p className="voice-hint voice-warn">
+                            配音目前只支持通义千问（DashScope
+                            CosyVoice）。请切换模型，并在阿里云百炼控制台开通语音合成。
+                          </p>
+                        )}
+                      </div>
                       <button
                         className="primary-button"
                         onClick={() => {
@@ -1321,47 +1435,6 @@ export default function App() {
                               </option>
                             ))}
                           </select>
-                        </div>
-                      </div>
-                      <div className="music-field">
-                        <label className="field-label" htmlFor="tts-voice">
-                          AI 配音
-                        </label>
-                        <div className="music-control">
-                          <span className="music-icon">
-                            <Volume2 size={17} />
-                          </span>
-                          <select
-                            id="tts-voice"
-                            value={ttsVoice}
-                            onChange={(e) => setTtsVoice(e.target.value)}
-                          >
-                            {(ttsVoices.length
-                              ? ttsVoices
-                              : [
-                                  { id: 'longanyang', name: '龙洋洋（女声·自然）' },
-                                  { id: 'longxiaochun_v2', name: '龙晓春（女声·温柔）' },
-                                  { id: 'longhuashuo_v2', name: '龙华硕（男声·沉稳）' },
-                                ]
-                            ).map((v) => (
-                              <option key={v.id} value={v.id}>
-                                {v.name}
-                              </option>
-                            ))}
-                          </select>
-                          <button
-                            className="voice-generate"
-                            title="生成全片配音"
-                            onClick={generateVoice}
-                            disabled={generatingVoice || !status?.configured}
-                          >
-                            {generatingVoice ? (
-                              <LoaderCircle size={15} className="spin" />
-                            ) : (
-                              <Sparkles size={15} />
-                            )}
-                            {generatingVoice ? '配音中…' : '生成配音'}
-                          </button>
                         </div>
                       </div>
                       <button

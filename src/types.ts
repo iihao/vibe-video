@@ -133,6 +133,7 @@ export interface ServerStatus {
   verified?: boolean;
   provider?: string;
   model: string;
+  tts?: boolean;
   ffmpeg: boolean;
   browser: boolean;
 }

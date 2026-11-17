@@ -601,33 +601,36 @@ function drawStandardFrame(canvas, project, time, options = {}) {
         globalChar += 1;
       }
     });
-    ctx.font = `${portrait ? 20 : 13}px "PingFang SC", sans-serif`;
-    ctx.fillStyle = p.faint;
-    const subWidth = portrait ? 830 : 420;
-    let subLines = [],
-      sub = '';
-    for (const char of scene.subtitle || '') {
-      if (
-        ctx.measureText(sub + char).width > subWidth &&
-        sub &&
-        !/[，。！？；：、）》」』】]/.test(char)
-      ) {
-        subLines.push(sub);
-        sub = char;
-      } else sub += char;
+    // 有配音时，底部逐字字幕会显示旁白文案，顶部不再重复画副标题。
+    if (!(scene.voice && scene.voice.words && scene.voice.words.length)) {
+      ctx.font = `${portrait ? 20 : 13}px "PingFang SC", sans-serif`;
+      ctx.fillStyle = p.faint;
+      const subWidth = portrait ? 830 : 420;
+      let subLines = [],
+        sub = '';
+      for (const char of scene.subtitle || '') {
+        if (
+          ctx.measureText(sub + char).width > subWidth &&
+          sub &&
+          !/[，。！？；：、）》」』】]/.test(char)
+        ) {
+          subLines.push(sub);
+          sub = char;
+        } else sub += char;
+      }
+      if (sub) subLines.push(sub);
+      const subY = portrait
+        ? titleY + lines.length * fontSize * 1.35 + 30
+        : titleY + lines.length * fontSize * 1.35 + 17;
+      // 副标题淡入跟随标题逐字完成后出现（index>0 时延后，首幕稍快）
+      const subDelay = index > 0 ? 0.35 : 0.15;
+      const subIn = Math.min(1, Math.max(0, (local - subDelay) / 0.4));
+      ctx.save();
+      ctx.globalAlpha = subIn;
+      ctx.translate(0, (1 - subIn) * 14);
+      subLines.forEach((str, i) => ctx.fillText(str, margin, subY + i * (portrait ? 34 : 24)));
+      ctx.restore();
     }
-    if (sub) subLines.push(sub);
-    const subY = portrait
-      ? titleY + lines.length * fontSize * 1.35 + 30
-      : titleY + lines.length * fontSize * 1.35 + 17;
-    // 副标题淡入跟随标题逐字完成后出现（index>0 时延后，首幕稍快）
-    const subDelay = index > 0 ? 0.35 : 0.15;
-    const subIn = Math.min(1, Math.max(0, (local - subDelay) / 0.4));
-    ctx.save();
-    ctx.globalAlpha = subIn;
-    ctx.translate(0, (1 - subIn) * 14);
-    subLines.forEach((str, i) => ctx.fillText(str, margin, subY + i * (portrait ? 34 : 24)));
-    ctx.restore();
     ctx.restore(); // 结束转场位移/淡入，页脚保持固定
     ctx.globalAlpha = 1;
     ctx.strokeStyle = p.faint;
@@ -687,76 +690,116 @@ function drawStandardFrame(canvas, project, time, options = {}) {
 }
 
 /* 逐字高亮字幕（Karaoke 字幕）：
- * 根据 TTS 返回的逐字时间戳，在当前播放时刻高亮正在朗读的字。
- * 已读字用 ink 色、当前字用 accent 色 + 放大、未读字用 faint 色。
+ * 只显示“当前一句”，用固定字号排版，高亮只改颜色与发光、不改变字宽，
+ * 因此整行位置稳定，不会随朗读进度左右抖动。
  * 时间戳是相对分镜起点的毫秒数，local 是相对分镜起点的秒数。 */
 function drawKaraokeCaption(ctx, words, local, p, W, H, portrait) {
   const nowMs = local * 1000;
-  // 找出当前正在朗读的字（nowMs 落在其 beginMs~endMs 内）
   const baseFontSize = portrait ? 30 : 24;
-  const highlightSize = baseFontSize * 1.35;
-  const y = portrait ? H - 120 : H - 108;
-  const maxWidth = W - (portrait ? 140 : 120);
-  ctx.textBaseline = 'middle';
+  const lineHeight = baseFontSize * 1.65;
+  const maxWidth = W - (portrait ? 160 : 200);
+  const sentenceEnd = /[。！？!?；;]/;
+  const y = portrait ? H - 150 : H - 120;
 
-  // 逐字排版（按可用宽度换行）
-  const placed = []; // {text, beginMs, endMs, x, y}
-  let cx = W / 2,
-    cy = y;
-  let lineWidth = 0;
-  ctx.font = `600 ${baseFontSize}px "PingFang SC", sans-serif`;
-  // 先按高亮字号估算每字宽度，累积换行
-  const wordWidths = words.map((w) => ctx.measureText(w.text).width * (highlightSize / baseFontSize));
-  let accX = 0;
-  const lineStartIdx = [];
+  // 最后一个已经开始朗读的字；还没开口时先展示第一句。
+  let rawActive = -1;
   for (let i = 0; i < words.length; i++) {
-    if (accX + wordWidths[i] > maxWidth && i > 0) {
-      lineStartIdx.push(i);
-      accX = wordWidths[i];
-    } else {
-      accX += wordWidths[i];
-    }
+    if (nowMs >= words[i].beginMs) rawActive = i;
+    else break;
   }
-  // 计算每行起始 x（居中）
-  const lines = [];
-  {
-    let start = 0;
-    const breaks = [...lineStartIdx, words.length];
-    for (const brk of breaks) {
-      let total = 0;
-      for (let i = start; i < brk; i++) total += wordWidths[i];
-      lines.push({ start, end: brk, totalWidth: total });
-      start = brk;
-    }
-  }
-  const lineHeight = baseFontSize * 1.8;
-  const firstY = y - ((lines.length - 1) * lineHeight) / 2;
+  const focus = Math.max(0, rawActive);
 
-  lines.forEach((line, li) => {
-    let x = W / 2 - line.totalWidth / 2;
+  // 只取当前句子（以句末标点为界），避免整段旁白常驻屏幕。
+  let start = focus;
+  let end = focus;
+  while (start > 0 && !sentenceEnd.test(words[start - 1].text)) start--;
+  while (end < words.length - 1 && !sentenceEnd.test(words[end].text)) end++;
+  const segment = words.slice(start, end + 1);
+  if (!segment.length) return;
+
+  // 把连续的数字/英文合并成不可拆分的词组，避免把「45」拆成「4 / 5」。
+  const isAlnumToken = (text) => /^[A-Za-z0-9%.]+$/.test(text);
+  const groups = [];
+  for (const word of segment) {
+    const prev = groups[groups.length - 1];
+    if (prev && isAlnumToken(word.text) && /[A-Za-z0-9%.]$/.test(prev.text)) {
+      prev.text += word.text;
+      prev.endMs = Math.max(prev.endMs, word.endMs);
+    } else groups.push({ ...word });
+  }
+
+  let activeIndex = -1;
+  for (let i = 0; i < groups.length; i++) {
+    if (nowMs >= groups[i].beginMs) activeIndex = i;
+    else break;
+  }
+
+  ctx.save();
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  const font = (size) => `600 ${size}px "PingFang SC", "Helvetica Neue", sans-serif`;
+  ctx.font = font(baseFontSize);
+  const tracking = baseFontSize * 0.06;
+  const widths = groups.map((w) => ctx.measureText(w.text).width);
+
+  // 固定用基础字号计算换行与居中，所有帧布局一致。
+  const lines = [];
+  let line = { start: 0, end: 0, width: 0 };
+  for (let i = 0; i < groups.length; i++) {
+    const add = widths[i] + (i > line.start ? tracking : 0);
+    // 句末标点尽量不单独换行。
+    const keepWithPrevious = /^[，。！？；：、）》」』】…]$/.test(groups[i].text);
+    if (line.width + add > maxWidth && i > line.start && !keepWithPrevious) {
+      line.end = i;
+      lines.push(line);
+      line = { start: i, end: i + 1, width: widths[i] };
+    } else {
+      line.width += add;
+      line.end = i + 1;
+    }
+  }
+  lines.push(line);
+
+  const totalHeight = lines.length * lineHeight;
+  const firstY = y - (totalHeight - lineHeight) / 2;
+  const boxTop = firstY - lineHeight * 0.62;
+  const boxBottom = firstY + (lines.length - 1) * lineHeight + lineHeight * 0.62;
+
+  // 底部压暗/压亮条，字幕压在图形或亮环上也能读。
+  const scrim = ctx.createLinearGradient(
+    0,
+    boxTop - lineHeight * 0.5,
+    0,
+    boxBottom + lineHeight * 0.5,
+  );
+  scrim.addColorStop(0, `${p.bg}00`);
+  scrim.addColorStop(0.18, `${p.bg}d9`);
+  scrim.addColorStop(0.82, `${p.bg}d9`);
+  scrim.addColorStop(1, `${p.bg}00`);
+  ctx.fillStyle = scrim;
+  ctx.fillRect(0, boxTop - lineHeight * 0.5, W, boxBottom - boxTop + lineHeight);
+
+  lines.forEach((ln, li) => {
+    let x = W / 2 - ln.width / 2;
     const ly = firstY + li * lineHeight;
-    for (let i = line.start; i < line.end; i++) {
-      const w = words[i];
-      const active = nowMs >= w.beginMs && nowMs < w.endMs;
-      const done = nowMs >= w.endMs;
-      const size = active ? highlightSize : baseFontSize;
-      ctx.font = `600 ${size}px "PingFang SC", sans-serif`;
-      ctx.fillStyle = active ? p.accent : done ? p.ink : p.faint;
-      ctx.globalAlpha = active ? 1 : done ? 0.9 : 0.55;
-      // 当前字加一点发光
-      if (active) {
+    for (let i = ln.start; i < ln.end; i++) {
+      const w = groups[i];
+      const current = i === activeIndex && nowMs < w.endMs;
+      const done = i < activeIndex || (i === activeIndex && nowMs >= w.endMs);
+      ctx.font = font(baseFontSize);
+      ctx.fillStyle = current ? p.accent : done ? p.ink : p.faint;
+      ctx.globalAlpha = current ? 1 : done ? 0.92 : 0.5;
+      if (current) {
         ctx.shadowColor = p.accent;
-        ctx.shadowBlur = 12;
+        ctx.shadowBlur = 14;
       }
-      const ww = ctx.measureText(w.text).width;
-      ctx.fillText(w.text, x + ww / 2, ly);
+      ctx.fillText(w.text, x, ly);
       ctx.shadowBlur = 0;
-      x += ww + baseFontSize * 0.18; // 字间距
-      // 实际推进用高亮字号宽度更接近布局，但为了稳定用统一字号宽度
+      x += widths[i] + tracking;
     }
   });
   ctx.globalAlpha = 1;
-  ctx.textBaseline = 'alphabetic';
+  ctx.restore();
 }
 
 /* 炫酷氛围层：持续流动的粒子场 + 缓慢扫过的光线，让画面"始终活着"。
@@ -873,8 +916,8 @@ export function drawFrame(canvas, project, time, options = {}) {
     return;
   }
   const low = document.createElement('canvas');
-  low.width = Math.max(1, Math.round(canvas.width / 4));
-  low.height = Math.max(1, Math.round(canvas.height / 4));
+  low.width = Math.max(1, Math.round(canvas.width / 2));
+  low.height = Math.max(1, Math.round(canvas.height / 2));
   drawStandardFrame(low, project, time, options);
   const ctx = canvas.getContext('2d');
   if (!ctx) return;

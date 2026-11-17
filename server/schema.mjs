@@ -61,6 +61,8 @@ const voiceSchema = z
     voice: z.string().max(60).optional(),
     words: z.array(voiceWordSchema).max(400),
     durationMs: z.number().nonnegative().optional(),
+    /** >1 表示为了塞进分镜做了节奏加速（ffmpeg atempo），逐字时间戳已按同一比例缩放。 */
+    tempo: z.number().min(1).max(2).optional(),
   })
   .optional();
 
@@ -96,7 +98,11 @@ export const storySchema = z.object({
 });
 export const projectSchema = configSchema
   .extend({
-    id: z.string().max(100),
+    // 项目 id 会参与服务端配音文件命名，只允许安全字符，避免路径穿越。
+    id: z
+      .string()
+      .max(100)
+      .regex(/^[A-Za-z0-9_-]+$/, '项目 ID 只能包含字母、数字、下划线和连字符'),
     title: storySchema.shape.title,
     scenes: storySchema.shape.scenes,
     sources: storySchema.shape.sources,
