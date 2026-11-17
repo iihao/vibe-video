@@ -49,7 +49,6 @@ import {
 } from 'lucide-react';
 import { defaultConfig, makeDemo, references, styles } from '../shared/catalog.mjs';
 import { drawFrame } from '../shared/renderer.mjs';
-import { registerNebula } from '../shared/nebula-webgl.mjs';
 import { sfxClips, sfxStyles } from '../shared/sfx.mjs';
 import { projectSchema } from '../server/schema.mjs';
 import { AISettings } from './components/AISettings';
@@ -67,8 +66,7 @@ import type {
   StyleId,
 } from './types';
 
-// 星云视觉的 WebGL 艺术层在应用启动时就注册，首帧即可生效。
-registerNebula();
+// 星云视觉的 WebGL 艺术层按需加载（见 main.tsx），首屏不背 three.js。
 
 type Page = 'create' | 'projects' | 'templates' | 'explore' | 'assets';
 type Modal = 'export' | 'settings' | 'help' | 'command' | null;
